@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
+from html import escape
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 
 app = FastAPI(title="notes")
@@ -87,6 +88,28 @@ def _write_file(path: str, body: str) -> None:
         f.write(body)
 
 
+def _render_note_html(note_id: int, body: str) -> str:
+    # body MUST be html.escape()d before interpolation — XSS boundary.
+    safe = escape(body)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Note #{note_id}</title>
+  <style>
+    body {{ font: 16px/1.5 system-ui, -apple-system, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; color: #222; }}
+    h1 {{ font-size: 1.25rem; margin-bottom: 1rem; color: #444; }}
+    pre {{ background: #f6f8fa; padding: 1rem; border-radius: 6px; white-space: pre-wrap; word-wrap: break-word; }}
+  </style>
+</head>
+<body>
+  <h1>Note #{note_id}</h1>
+  <pre>{safe}</pre>
+</body>
+</html>
+"""
+
+
 @app.post("/notes/export")
 def export_note(payload: ExportIn) -> dict[str, str]:
     # Empty-store behaviour is defined explicitly: an empty store is a
@@ -116,6 +139,23 @@ def import_note(path: str) -> dict[str, str]:
     except (PermissionError, OSError):
         raise HTTPException(status_code=400, detail="import failed: file system error")
     return {"body": body}
+
+
+@app.get("/notes/{note_id}/html")
+def get_note_html(note_id: int):
+    note = _NOTES.get(note_id)
+    if note is None:
+        not_found = (
+            f"<!doctype html><html><head><meta charset=\"utf-8\">"
+            f"<title>Note not found</title></head>"
+            f"<body><h1>Note not found</h1>"
+            f"<p>No note with id {escape(str(note_id))} exists.</p></body></html>"
+        )
+        return Response(content=not_found, media_type="text/html", status_code=404)
+    return Response(
+        content=_render_note_html(note_id, note),
+        media_type="text/html",
+    )
 
 
 @app.get("/notes/{note_id}")
