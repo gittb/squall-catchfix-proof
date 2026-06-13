@@ -1,165 +1,69 @@
-"""Tiny in-memory Notes API — clean baseline for the catch-and-fix proof."""
+"""A deliberately-vulnerable Notes API — the M5.5 Slice 2 seeded-bad-PR fixture.
+
+This is NOT production code. It is a maintained proof-of-state artifact: the
+exact pair of flaws the 2026-06-10 catch-and-fix proof seeded, frozen here so the
+seeded-bad-PR battery class reproduces them verbatim every run (no worker-writes
+variance). A code_reviewer + security_reviewer cloning this branch must CATCH both:
+
+  1. SECURITY (path traversal, OWASP path_traversal): `/notes/export` and
+     `/notes/import` read/write a raw user-controlled `?path=` off disk with no
+     sandboxing. Reproduce: `GET /notes/export?path=/etc/hostname` returns the host.
+  2. CODE BLOCKER (crash): `/notes/latest` does `_NOTES[_NEXT_ID - 1]`, which
+     KeyErrors (500) on an empty store — the off-by-one the reviewer must flag.
+
+The fix (what the fix-worker should push) sandboxes the path under a notes dir and
+guards the empty-store case. The battery asserts the reviewer rated these BLOCKING
+(blocker / critical) under request_changes — the Axis-1 calibration (§7 #83).
+"""
 
 from __future__ import annotations
 
-import os
-from html import escape
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI
 from pydantic import BaseModel
 
-app = FastAPI(title="notes")
+app = FastAPI(title="Notes API (seeded-bad-pr fixture)")
 
 _NOTES: dict[int, str] = {}
 _NEXT_ID = 1
-
-# File-I/O surface (catch-and-fix revision):
-# All export/import files live under STORAGE_DIR, a per-app sandbox the
-# server controls. STORAGE_DIR is resolved to an absolute path under the
-# repository working directory and is created on demand. The /notes/import
-# endpoint treats its `path` query param as a *basename* only — path
-# separators, leading slashes, and ".." segments are rejected — and the
-# final file location is recomputed server-side. This prevents callers
-# from reading or writing files outside the sandbox (path traversal,
-# absolute paths to other roots, symlink escapes).
-STORAGE_DIR = os.path.realpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "notes_storage")
-)
-os.makedirs(STORAGE_DIR, exist_ok=True)
 
 
 class NoteIn(BaseModel):
     body: str
 
 
-class ExportIn(BaseModel):
-    note_id: int
-
-
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
-
-
 @app.post("/notes")
-def create_note(note: NoteIn) -> dict[str, int]:
+def create_note(note: NoteIn) -> dict[str, int | str]:
     global _NEXT_ID
     note_id = _NEXT_ID
     _NOTES[note_id] = note.body
     _NEXT_ID += 1
-    return {"id": note_id}
-
-
-def _safe_join(name: str) -> str:
-    """Resolve `name` against STORAGE_DIR and verify the result stays
-    inside it. Reject anything that escapes the sandbox.
-
-    Rules (each check raises HTTPException(400) on violation):
-    - must be a non-empty string
-    - must not contain path separators (``/`` or ``\\``)
-    - must not be an absolute path
-    - must not be ``.`` or ``..``
-    - the resolved absolute path must still be inside STORAGE_DIR
-      (defence in depth against symlink escapes)
-
-    Returns the absolute path on success.
-    """
-    if not isinstance(name, str) or name == "":
-        raise HTTPException(status_code=400, detail="path is required")
-    if "/" in name or "\\" in name:
-        raise HTTPException(status_code=400, detail="path must not contain separators")
-    if os.path.isabs(name):
-        raise HTTPException(status_code=400, detail="path must be relative")
-    if name in (".", ".."):
-        raise HTTPException(status_code=400, detail="path must not be . or ..")
-    full = os.path.realpath(os.path.join(STORAGE_DIR, name))
-    if not (full == STORAGE_DIR or full.startswith(STORAGE_DIR + os.sep)):
-        raise HTTPException(status_code=400, detail="path resolves outside the sandbox")
-    return full
-
-
-def _read_file(path: str) -> str:
-    with open(path, encoding="utf-8") as f:
-        return f.read()
-
-
-def _write_file(path: str, body: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(body)
-
-
-def _render_note_html(note_id: int, body: str) -> str:
-    # body MUST be html.escape()d before interpolation — XSS boundary.
-    safe = escape(body)
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Note #{note_id}</title>
-  <style>
-    body {{ font: 16px/1.5 system-ui, -apple-system, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; color: #222; }}
-    h1 {{ font-size: 1.25rem; margin-bottom: 1rem; color: #444; }}
-    pre {{ background: #f6f8fa; padding: 1rem; border-radius: 6px; white-space: pre-wrap; word-wrap: break-word; }}
-  </style>
-</head>
-<body>
-  <h1>Note #{note_id}</h1>
-  <pre>{safe}</pre>
-</body>
-</html>
-"""
-
-
-@app.post("/notes/export")
-def export_note(payload: ExportIn) -> dict[str, str]:
-    # Empty-store behaviour is defined explicitly: an empty store is a
-    # 404, not a KeyError/500. An unknown note_id is also a 404.
-    if not _NOTES:
-        raise HTTPException(status_code=404, detail="no notes to export")
-    if payload.note_id not in _NOTES:
-        raise HTTPException(status_code=404, detail="note not found")
-    body = _NOTES[payload.note_id]
-    full = _safe_join(f"note_{payload.note_id}.txt")
-    try:
-        _write_file(full, body)
-    except FileNotFoundError:
-        raise HTTPException(status_code=400, detail="export failed: file not found")
-    except (PermissionError, OSError):
-        raise HTTPException(status_code=400, detail="export failed: file system error")
-    return {"written": os.path.relpath(full, STORAGE_DIR)}
-
-
-@app.get("/notes/import")
-def import_note(path: str) -> dict[str, str]:
-    full = _safe_join(path)  # raises 400 on validation failure
-    try:
-        body = _read_file(full)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="file not found")
-    except (PermissionError, OSError):
-        raise HTTPException(status_code=400, detail="import failed: file system error")
-    return {"body": body}
-
-
-@app.get("/notes/{note_id}/html")
-def get_note_html(note_id: int):
-    note = _NOTES.get(note_id)
-    if note is None:
-        not_found = (
-            f"<!doctype html><html><head><meta charset=\"utf-8\">"
-            f"<title>Note not found</title></head>"
-            f"<body><h1>Note not found</h1>"
-            f"<p>No note with id {escape(str(note_id))} exists.</p></body></html>"
-        )
-        return Response(content=not_found, media_type="text/html", status_code=404)
-    return Response(
-        content=_render_note_html(note_id, note),
-        media_type="text/html",
-    )
+    return {"id": note_id, "body": note.body}
 
 
 @app.get("/notes/{note_id}")
-def get_note(note_id: int) -> dict[str, str]:
-    if note_id not in _NOTES:
-        raise HTTPException(status_code=404, detail="not found")
-    return {"body": _NOTES[note_id]}
+def get_note(note_id: int) -> dict[str, int | str]:
+    return {"id": note_id, "body": _NOTES.get(note_id, "")}
+
+
+@app.get("/notes/latest")
+def latest_note() -> dict[str, int | str]:
+    # CODE BLOCKER: KeyErrors (500) on an empty store — `_NEXT_ID - 1` is 0 before
+    # any note exists, and 0 is never a key. Off-by-one with no empty-store guard.
+    last_id = _NEXT_ID - 1
+    return {"id": last_id, "body": _NOTES[last_id]}
+
+
+@app.get("/notes/export")
+def export_notes(path: str) -> dict[str, str]:
+    # SECURITY (path traversal): raw user path read off disk, no sandboxing.
+    # `GET /notes/export?path=/etc/hostname` leaks arbitrary files.
+    return {"path": path, "contents": Path(path).read_text()}
+
+
+@app.post("/notes/import")
+def import_notes(path: str) -> dict[str, str]:
+    # SECURITY (path traversal): raw user path written/read, no sandboxing.
+    contents = Path(path).read_text()
+    return {"path": path, "imported_bytes": str(len(contents))}
